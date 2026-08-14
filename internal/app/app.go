@@ -47,6 +47,8 @@ func (a *App) addScore(w http.ResponseWriter, r *http.Request) {
 	var in struct { UserID int64 `json:"user_id"`; Channel string `json:"channel"`; Points int `json:"points"`; SourceEventID string `json:"source_event_id"`; DurationSeconds int `json:"duration_seconds"` }
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil || in.UserID <= 0 || in.Channel == "" || in.SourceEventID == "" { writeError(w, 400, "invalid_request"); return }
 	var accepted int
+	// The database function owns validation and all counter updates so concurrent
+	// requests cannot partially update daily and weekly totals.
 	err := a.db.QueryRow(r.Context(), "select add_score($1,$2,$3,$4,$5,$6)", in.UserID, in.Channel, in.Points, in.SourceEventID, in.DurationSeconds, time.Now().In(a.loc)).Scan(&accepted)
 	if err != nil { writeError(w, 409, err.Error()); return }
 	writeJSON(w, 200, map[string]int{"accepted_points":accepted})
@@ -54,22 +56,22 @@ func (a *App) addScore(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) leaderboard(w http.ResponseWriter, r *http.Request) {
 	uid, _ := strconv.ParseInt(r.URL.Query().Get("user_id"), 10, 64); if uid <= 0 { writeError(w,400,"invalid_user_id"); return }
-	rows, err := a.db.Query(r.Context(), `select m2.user_id, coalesce(s.score,0), row_number() over(order by coalesce(s.score,0) desc, m2.user_id) from period_members m join periods p on p.id=m.period_id and p.status='active' join period_members m2 on m2.period_id=m.period_id and m2.group_id=m.group_id left join period_scores s on s.period_id=m2.period_id and s.user_id=m2.user_id where m.user_id=$1 order by 3, m2.user_id`, uid)
+	rows, err := a.db.Query(r.Context(), `select m2.user_id,coalesce(s.score,0),row_number() over(order by coalesce(s.score,0) desc,s.reached_at asc nulls last,m2.user_id),s.reached_at,m2.stage from period_members m join periods p on p.id=m.period_id and p.status='active' join period_members m2 on m2.period_id=m.period_id and m2.group_id=m.group_id left join period_scores s on s.period_id=m2.period_id and s.user_id=m2.user_id where m.user_id=$1 order by 3`, uid)
 	if err != nil { writeError(w,500,"query_failed"); return }; defer rows.Close()
-	type item struct { UserID int64 `json:"user_id"`; Score int64 `json:"score"`; Rank int `json:"rank"` }
-	items := []item{}; for rows.Next() { var x item; if rows.Scan(&x.UserID,&x.Score,&x.Rank)==nil { items=append(items,x) } }
+	type item struct { UserID int64 `json:"user_id"`; Score int64 `json:"score"`; Rank int `json:"rank"`; ReachedAt *time.Time `json:"reached_at,omitempty"`; Stage int `json:"stage"` }
+	items := []item{}; for rows.Next() { var x item; if rows.Scan(&x.UserID,&x.Score,&x.Rank,&x.ReachedAt,&x.Stage)==nil { items=append(items,x) } }
 	writeJSON(w,200,items)
 }
 
 func (a *App) previousSettlementLeaderboard(w http.ResponseWriter, r *http.Request) {
 	uid,_:=strconv.ParseInt(r.URL.Query().Get("user_id"),10,64)
 	if uid<=0 { writeError(w,400,"invalid_user_id"); return }
-	rows,err:=a.db.Query(r.Context(),`select s.period_id,s.group_id,s.user_id,s.final_score,s.rank,s.old_tier,s.new_tier,s.promoted from settlements mine join settlements s on s.period_id=mine.period_id and s.group_id=mine.group_id join periods p on p.id=mine.period_id where mine.user_id=$1 and p.status='finished' and mine.period_id=(select max(x.period_id) from settlements x join periods px on px.id=x.period_id where x.user_id=$1 and px.status='finished') order by s.rank,s.user_id`,uid)
+	rows,err:=a.db.Query(r.Context(),`select s.period_id,s.group_id,s.user_id,s.final_score,s.rank,s.old_tier,s.new_tier,s.promoted,s.reached_at,s.stage from settlements mine join settlements s on s.period_id=mine.period_id and s.group_id=mine.group_id join periods p on p.id=mine.period_id where mine.user_id=$1 and p.status='finished' and mine.period_id=(select max(x.period_id) from settlements x join periods px on px.id=x.period_id where x.user_id=$1 and px.status='finished') order by s.rank,s.user_id`,uid)
 	if err!=nil { writeError(w,500,"query_failed"); return }
 	defer rows.Close()
-	type item struct { PeriodID int64 `json:"period_id"`; GroupID int64 `json:"group_id"`; UserID int64 `json:"user_id"`; FinalScore int64 `json:"final_score"`; Rank int `json:"rank"`; OldTier int `json:"old_tier"`; NewTier int `json:"new_tier"`; Promoted bool `json:"promoted"` }
+	type item struct { PeriodID int64 `json:"period_id"`; GroupID int64 `json:"group_id"`; UserID int64 `json:"user_id"`; FinalScore int64 `json:"final_score"`; Rank int `json:"rank"`; OldTier int `json:"old_tier"`; NewTier int `json:"new_tier"`; Promoted bool `json:"promoted"`; ReachedAt *time.Time `json:"reached_at,omitempty"`; Stage int `json:"stage"` }
 	items:=[]item{}
-	for rows.Next(){var x item;if err:=rows.Scan(&x.PeriodID,&x.GroupID,&x.UserID,&x.FinalScore,&x.Rank,&x.OldTier,&x.NewTier,&x.Promoted);err!=nil{writeError(w,500,"scan_failed");return};items=append(items,x)}
+	for rows.Next(){var x item;if err:=rows.Scan(&x.PeriodID,&x.GroupID,&x.UserID,&x.FinalScore,&x.Rank,&x.OldTier,&x.NewTier,&x.Promoted,&x.ReachedAt,&x.Stage);err!=nil{writeError(w,500,"scan_failed");return};items=append(items,x)}
 	writeJSON(w,200,items)
 }
 
