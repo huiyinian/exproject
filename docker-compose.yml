@@ -17,3 +17,11 @@ services:
     ports: ["8080:8080"]
     depends_on:
       postgres: {condition: service_healthy}
+  worker:
+    build: .
+    entrypoint: ["/weekly-worker"]
+    environment:
+      DATABASE_URL: postgres://contest:contest@postgres:5432/contest?sslmode=disable
+      APP_TIMEZONE: Asia/Shanghai
+    depends_on:
+      postgres: {condition: service_healthy}
