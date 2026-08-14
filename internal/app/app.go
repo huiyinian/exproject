@@ -36,10 +36,10 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, 200, map[string]string{"status":"ok"}) })
 	mux.HandleFunc("POST /v1/scores", a.addScore)
 	mux.HandleFunc("GET /v1/leaderboard", a.leaderboard)
+	mux.HandleFunc("GET /v1/settlements/previous", a.previousSettlementLeaderboard)
 	mux.HandleFunc("POST /internal/periods/prepare", a.preparePeriod)
 	mux.HandleFunc("POST /internal/periods/rollover", a.rolloverPeriod)
 	mux.HandleFunc("POST /internal/jobs/run-once", a.runJobOnce)
-	mux.HandleFunc("POST /v1/rewards/{tier}/claim", a.claimReward)
 	return mux
 }
 
@@ -61,9 +61,20 @@ func (a *App) leaderboard(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w,200,items)
 }
 
+func (a *App) previousSettlementLeaderboard(w http.ResponseWriter, r *http.Request) {
+	uid,_:=strconv.ParseInt(r.URL.Query().Get("user_id"),10,64)
+	if uid<=0 { writeError(w,400,"invalid_user_id"); return }
+	rows,err:=a.db.Query(r.Context(),`select s.period_id,s.group_id,s.user_id,s.final_score,s.rank,s.old_tier,s.new_tier,s.promoted from settlements mine join settlements s on s.period_id=mine.period_id and s.group_id=mine.group_id join periods p on p.id=mine.period_id where mine.user_id=$1 and p.status='finished' and mine.period_id=(select max(x.period_id) from settlements x join periods px on px.id=x.period_id where x.user_id=$1 and px.status='finished') order by s.rank,s.user_id`,uid)
+	if err!=nil { writeError(w,500,"query_failed"); return }
+	defer rows.Close()
+	type item struct { PeriodID int64 `json:"period_id"`; GroupID int64 `json:"group_id"`; UserID int64 `json:"user_id"`; FinalScore int64 `json:"final_score"`; Rank int `json:"rank"`; OldTier int `json:"old_tier"`; NewTier int `json:"new_tier"`; Promoted bool `json:"promoted"` }
+	items:=[]item{}
+	for rows.Next(){var x item;if err:=rows.Scan(&x.PeriodID,&x.GroupID,&x.UserID,&x.FinalScore,&x.Rank,&x.OldTier,&x.NewTier,&x.Promoted);err!=nil{writeError(w,500,"scan_failed");return};items=append(items,x)}
+	writeJSON(w,200,items)
+}
+
 func (a *App) preparePeriod(w http.ResponseWriter, r *http.Request) { var id int64; err:=a.db.QueryRow(r.Context(),"select prepare_next_period($1)",time.Now().In(a.loc)).Scan(&id); if err!=nil {writeError(w,409,err.Error());return}; writeJSON(w,200,map[string]int64{"period_id":id}) }
 func (a *App) rolloverPeriod(w http.ResponseWriter, r *http.Request) { var oldID,newID int64; err:=a.db.QueryRow(r.Context(),"select old_period_id,new_period_id from rollover_period($1)",time.Now().In(a.loc)).Scan(&oldID,&newID); if err!=nil {writeError(w,409,err.Error());return}; writeJSON(w,200,map[string]int64{"old_period_id":oldID,"new_period_id":newID}) }
 func (a *App) runJobOnce(w http.ResponseWriter, r *http.Request) { ran,err:=a.RunOneJob(r.Context()); if err!=nil {writeError(w,500,err.Error());return}; writeJSON(w,200,map[string]bool{"ran":ran}) }
-func (a *App) claimReward(w http.ResponseWriter, r *http.Request) { tier,_:=strconv.Atoi(r.PathValue("tier")); uid,_:=strconv.ParseInt(r.URL.Query().Get("user_id"),10,64); tag,err:=a.db.Exec(r.Context(),`insert into reward_claims(user_id,tier,reward_snapshot) select u.id,r.tier,r.reward from users u join tier_rules r on r.tier=$2 where u.id=$1 and u.highest_tier>=r.tier on conflict do nothing`,uid,tier); if err!=nil {writeError(w,500,"claim_failed");return}; if tag.RowsAffected()==0 {writeError(w,409,"already_claimed_or_not_eligible");return}; writeJSON(w,200,map[string]any{"claimed":true,"tier":tier}) }
 func writeJSON(w http.ResponseWriter, status int, v any) { w.Header().Set("Content-Type","application/json"); w.WriteHeader(status); _=json.NewEncoder(w).Encode(v) }
 func writeError(w http.ResponseWriter,status int,msg string){writeJSON(w,status,map[string]string{"error":msg})}
