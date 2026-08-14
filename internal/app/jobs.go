@@ -16,6 +16,8 @@ type periodJob struct {
 	Payload []byte
 }
 
+// RunOneJob leases and executes a single durable database job. Database-side
+// idempotency makes it safe for a crashed worker's lease to be reclaimed.
 func (a *App) RunOneJob(ctx context.Context) (bool, error) {
 	var job periodJob
 	err := a.db.QueryRow(ctx, `select id,period_id,job_type,payload from claim_period_job()`).Scan(&job.ID,&job.PeriodID,&job.JobType,&job.Payload)
@@ -54,6 +56,8 @@ func (a *App) RunOneJob(ctx context.Context) (bool, error) {
 }
 
 func (a *App) PrepareAndRollover(ctx context.Context) error {
+	// Both functions are idempotent, so every worker instance may poll once per
+	// minute; the database advisory lock serializes the actual noon rollover.
 	now := a.now()
 	if _,err:=a.db.Exec(ctx,"select prepare_next_period($1)",now); err!=nil{return err}
 	_,err:=a.db.Exec(ctx,"select * from rollover_period($1)",now)
