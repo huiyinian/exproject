@@ -23,21 +23,22 @@ PostgreSQL 是唯一事实源。加分、时长校验、每日限额判断、来
 docker compose up --build
 ```
 
-创建用户后，调用 `POST /internal/periods/start` 建立本期分组。生产环境应由调度系统在周一 12:00 调用，内部接口应加鉴权。
+API 与 Worker 分开运行。Worker 每分钟幂等检查周期：提前创建 `preparing` 周期；周一 12:00 后把旧周期切到 `settling`，新周期立即开始收分，再异步完成五个段位结算、更新段位、分组和激活。内部接口应增加生产鉴权。
 
 ```sql
 insert into users(id) select generate_series(1,120);
 ```
 
 ```bash
-curl -X POST localhost:8080/internal/periods/start
+curl -X POST localhost:8080/internal/periods/prepare
+curl -X POST localhost:8080/internal/periods/rollover
 curl -X POST localhost:8080/v1/scores -H 'content-type: application/json' \
   -d '{"user_id":1,"channel":"channel_a","points":100,"source_event_id":"event-1","duration_seconds":180}'
 curl 'localhost:8080/v1/leaderboard?user_id=1'
 curl -X POST 'localhost:8080/v1/rewards/1/claim?user_id=1'
 ```
 
-结算接口只会选择已经到达 `ends_at` 的周期：`POST /internal/periods/settle`。
+正常情况下无需手工结算；`worker` 会消费 `period_jobs`。也可用 `POST /internal/jobs/run-once` 手工执行一个任务以便调试。
 
 ## 关键约定
 
