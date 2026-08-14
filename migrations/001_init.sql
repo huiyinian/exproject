@@ -28,7 +28,8 @@ create table periods (
   id bigint generated always as identity primary key,
   starts_at timestamptz not null unique,
   ends_at timestamptz not null unique,
-  status text not null check (status in ('active','settling','finished')),
+  previous_period_id bigint references periods(id),
+  status text not null check (status in ('preparing','active','settling','finished')),
   check (ends_at = starts_at + interval '7 days')
 );
 create table period_groups (
@@ -68,6 +69,20 @@ create table reward_claims (
   reward_snapshot jsonb not null, claimed_at timestamptz not null default now(),
   primary key(user_id,tier)
 );
+create table period_jobs (
+  id bigint generated always as identity primary key,
+  job_key text not null unique,
+  period_id bigint not null references periods(id),
+  job_type text not null check(job_type in('settle_tier','finalize_settlement','create_groups','activate_period')),
+  payload jsonb not null default '{}',
+  status text not null default 'pending' check(status in('pending','running','succeeded')),
+  retry_count integer not null default 0,
+  available_at timestamptz not null default now(),
+  last_error text,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create index idx_period_jobs_claim on period_jobs(status,available_at,id);
 
 create or replace function add_score(p_user bigint,p_channel text,p_points int,p_source_event text,p_duration_seconds int,p_now timestamptz) returns int language plpgsql as $$
 declare v_period bigint; v_channel_limit int; v_min_duration int; v_channel_used int; v_total_used int;
@@ -77,7 +92,7 @@ begin
   select daily_limit,min_duration_seconds into v_channel_limit,v_min_duration from channel_rules where channel=p_channel;
   if not found then raise exception 'invalid_channel'; end if;
   if p_duration_seconds<v_min_duration then raise exception 'duration_not_enough'; end if;
-  select id into v_period from periods where status='active' and starts_at<=p_now and p_now<ends_at for update;
+  select id into v_period from periods where status in('preparing','active') and starts_at<=p_now and p_now<ends_at for update;
   if not found then raise exception 'no_active_period'; end if;
   perform pg_advisory_xact_lock(p_user);
   select coalesce(score,0) into v_channel_used from daily_scores where user_id=p_user and score_date=(p_now at time zone 'Asia/Shanghai')::date and channel=p_channel;
@@ -90,33 +105,93 @@ begin
   return p_points;
 end $$;
 
-create or replace function start_weekly_period(p_now timestamptz) returns bigint language plpgsql as $$
-declare v_start timestamptz; v_period bigint;
+create or replace function prepare_next_period(p_now timestamptz) returns bigint language plpgsql as $$
+declare v_start timestamptz; v_period bigint; v_previous bigint;
 begin
   v_start := date_trunc('week',p_now at time zone 'Asia/Shanghai') at time zone 'Asia/Shanghai' + interval '12 hours';
-  if p_now<v_start then v_start:=v_start-interval '7 days'; end if;
-  insert into periods(starts_at,ends_at,status) values(v_start,v_start+interval '7 days','active') on conflict(starts_at) do update set starts_at=excluded.starts_at returning id into v_period;
-  insert into period_groups(period_id,tier,group_no) select v_period,tier,grp from (select tier,ceil(row_number() over(partition by tier order by id)::numeric/50)::int grp from users) x group by tier,grp on conflict do nothing;
-  insert into period_members(period_id,group_id,user_id,tier) select v_period,g.id,u.id,u.tier from (select id,tier,ceil(row_number() over(partition by tier order by id)::numeric/50)::int grp from users) u join period_groups g on g.period_id=v_period and g.tier=u.tier and g.group_no=u.grp on conflict do nothing;
+  if p_now>=v_start then v_start:=v_start+interval '7 days'; end if;
+  select id into v_previous from periods where ends_at=v_start;
+  insert into periods(starts_at,ends_at,previous_period_id,status) values(v_start,v_start+interval '7 days',v_previous,'preparing') on conflict(starts_at) do update set starts_at=excluded.starts_at returning id into v_period;
   return v_period;
 end $$;
 
-create or replace function settle_weekly_period(p_now timestamptz) returns bigint language plpgsql as $$
-declare v_period bigint;
+create or replace function rollover_period(p_now timestamptz) returns table(old_period_id bigint,new_period_id bigint) language plpgsql as $$
+declare v_start timestamptz;
 begin
-  select id into v_period from periods where ends_at<=p_now and status in('active','settling') order by ends_at desc limit 1 for update;
-  if not found then raise exception 'no_period_to_settle'; end if;
-  update periods set status='settling' where id=v_period;
+  perform pg_advisory_xact_lock(861204);
+  v_start:=date_trunc('week',p_now at time zone 'Asia/Shanghai') at time zone 'Asia/Shanghai'+interval '12 hours';
+  if p_now<v_start then return; end if;
+  select id into old_period_id from periods where ends_at=v_start and status in('active','settling');
+  select id into new_period_id from periods where starts_at=v_start;
+  if new_period_id is null then
+    insert into periods(starts_at,ends_at,previous_period_id,status) values(v_start,v_start+interval '7 days',old_period_id,'preparing') returning id into new_period_id;
+  end if;
+  if old_period_id is null then
+    insert into period_jobs(job_key,period_id,job_type) values(new_period_id||':groups',new_period_id,'create_groups') on conflict do nothing;
+    return next; return;
+  end if;
+  update periods set status='settling' where id=old_period_id and status='active';
+  for i in 1..5 loop
+    insert into period_jobs(job_key,period_id,job_type,payload) values(old_period_id||':settle:'||i,old_period_id,'settle_tier',jsonb_build_object('tier',i)) on conflict do nothing;
+  end loop;
+  return next;
+end $$;
+
+create or replace function settle_period_tier(p_period bigint,p_tier int) returns void language plpgsql as $$
+begin
   insert into settlements(period_id,user_id,group_id,rank,old_tier,new_tier,final_score,promoted)
   select period_id,user_id,group_id,rn,old_tier,case when promoted then least(5,old_tier+1) else greatest(1,old_tier-1) end,score,promoted from (
     select x.*,rn<=ceil(cnt*promotion_percent/100.0) promoted from (
       select m.period_id,m.user_id,m.group_id,m.tier old_tier,coalesce(s.score,0) score,r.promotion_percent,
       row_number() over(partition by m.group_id order by coalesce(s.score,0) desc,m.user_id) rn,count(*) over(partition by m.group_id) cnt
-      from period_members m left join period_scores s using(period_id,user_id) join tier_rules r on r.tier=m.tier where m.period_id=v_period
+      from period_members m left join period_scores s using(period_id,user_id) join tier_rules r on r.tier=m.tier where m.period_id=p_period and m.tier=p_tier
     ) x
-  ) y on conflict(period_id,user_id) do nothing;
-  update users u set tier=s.new_tier,highest_tier=greatest(u.highest_tier,s.new_tier) from settlements s where s.period_id=v_period and s.user_id=u.id;
-  update periods set status='finished' where id=v_period;
-  return v_period;
+  ) y on conflict(period_id,user_id) do update set rank=excluded.rank,final_score=excluded.final_score,new_tier=excluded.new_tier,promoted=excluded.promoted;
+end $$;
+
+create or replace function finalize_settlement(p_period bigint) returns void language plpgsql as $$
+declare v_next bigint; v_members bigint; v_settled bigint;
+begin
+  select count(*) into v_members from period_members where period_id=p_period;
+  select count(*) into v_settled from settlements where period_id=p_period;
+  if v_members<>v_settled then raise exception 'settlement_count_mismatch: members %, settled %',v_members,v_settled; end if;
+  update users u set tier=s.new_tier,highest_tier=greatest(u.highest_tier,s.new_tier) from settlements s where s.period_id=p_period and s.user_id=u.id;
+  update periods set status='finished' where id=p_period;
+  select id into v_next from periods where previous_period_id=p_period;
+  if v_next is null then raise exception 'next_period_not_found'; end if;
+  insert into period_jobs(job_key,period_id,job_type) values(v_next||':groups',v_next,'create_groups') on conflict do nothing;
+end $$;
+
+create or replace function create_period_groups(p_period bigint) returns void language plpgsql as $$
+begin
+  insert into period_groups(period_id,tier,group_no)
+  select p_period,tier,grp from (select tier,ceil(row_number() over(partition by tier order by hashtextextended(id::text,p_period))/50.0)::int grp from users) x group by tier,grp on conflict do nothing;
+  insert into period_members(period_id,group_id,user_id,tier)
+  select p_period,g.id,u.id,u.tier from (select id,tier,ceil(row_number() over(partition by tier order by hashtextextended(id::text,p_period))/50.0)::int grp from users) u join period_groups g on g.period_id=p_period and g.tier=u.tier and g.group_no=u.grp on conflict do nothing;
+  insert into period_jobs(job_key,period_id,job_type) values(p_period||':activate',p_period,'activate_period') on conflict do nothing;
+end $$;
+
+create or replace function activate_period(p_period bigint) returns void language plpgsql as $$
+declare v_users bigint; v_members bigint;
+begin
+  select count(*) into v_users from users;
+  select count(*) into v_members from period_members where period_id=p_period;
+  if v_users<>v_members then raise exception 'member_count_mismatch: users %, members %',v_users,v_members; end if;
+  update periods set status='active' where id=p_period and status='preparing';
+end $$;
+
+create or replace function claim_period_job() returns table(id bigint,period_id bigint,job_type text,payload jsonb) language plpgsql as $$
+begin
+  return query update period_jobs j set status='running',updated_at=now() where j.id=(select x.id from period_jobs x where x.status='pending' and x.available_at<=now() order by x.id for update skip locked limit 1) returning j.id,j.period_id,j.job_type,j.payload;
+end $$;
+
+create or replace function complete_period_job(p_job bigint) returns void language plpgsql as $$
+declare v_period bigint; v_type text; v_remaining int;
+begin
+  update period_jobs set status='succeeded',last_error=null,updated_at=now() where id=p_job returning period_id,job_type into v_period,v_type;
+  if v_type='settle_tier' then
+    select count(*) into v_remaining from period_jobs where period_id=v_period and job_type='settle_tier' and status<>'succeeded';
+    if v_remaining=0 then insert into period_jobs(job_key,period_id,job_type) values(v_period||':finalize',v_period,'finalize_settlement') on conflict do nothing; end if;
+  end if;
 end $$;
 commit;
