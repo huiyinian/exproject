@@ -17,6 +17,8 @@ func main() {
 	a,err:=app.New(ctx,cfg); if err!=nil{log.Fatal(err)}
 	defer a.Close()
 
+	// Scheduling is intentionally cheap. Heavy settlement, grouping, and reward
+	// work is persisted in period_jobs and consumed separately below.
 	scheduleTicker:=time.NewTicker(time.Minute)
 	jobTicker:=time.NewTicker(200*time.Millisecond)
 	defer scheduleTicker.Stop(); defer jobTicker.Stop()
