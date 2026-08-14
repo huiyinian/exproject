@@ -64,6 +64,8 @@ create table settlements (
   final_score bigint not null, promoted boolean not null,
   primary key(period_id,user_id)
 );
+create index idx_settlements_user_period on settlements(user_id,period_id desc);
+create index idx_settlements_period_group_rank on settlements(period_id,group_id,rank,user_id);
 create table reward_grants (
   id bigint generated always as identity primary key,
   source_period_id bigint not null references periods(id),
