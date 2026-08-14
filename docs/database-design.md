@@ -16,8 +16,8 @@
 | `tier_rules` | 5 | 晋升比例、奖励快照来源 | PK `tier` |
 | `periods` | 每周 1 | 周期及状态 | `starts_at`、`ends_at` 唯一；左闭右开查询 |
 | `period_groups` | 约 1.2 万/期 | 段位内的组 | UNIQUE `(period_id,tier,group_no)` |
-| `period_members` | 60 万/期 | 冻结本期用户分组和段位 | PK `(period_id,user_id)`；UNIQUE `(group_id,user_id)`；INDEX `(user_id,period_id desc)` |
-| `period_scores` | 最多 60 万/期 | 本期累计积分 | PK `(period_id,user_id)` |
+| `period_members` | 60 万/期 | 冻结本期用户分组、段位和学段 | PK `(period_id,user_id)`；UNIQUE `(group_id,user_id)`；INDEX `(user_id,period_id desc)` |
+| `period_scores` | 最多 60 万/期 | 本期累计积分及达到时间 | PK `(period_id,user_id)` |
 | `daily_scores` | 最多 180 万/日 | 用户各渠道当日累计值 | PK `(user_id,score_date,channel)` |
 | `score_events` | 取决于活跃度 | 审计和来源事件幂等 | PK `source_event_id`；INDEX `(user_id,created_at desc)` |
 | `settlements` | 60 万/期 | 冻结最终名次、段位变化 | PK `(period_id,user_id)` |
