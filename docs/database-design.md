@@ -21,7 +21,8 @@
 | `daily_scores` | 最多 180 万/日 | 用户各渠道当日累计值 | PK `(user_id,score_date,channel)` |
 | `score_events` | 取决于活跃度 | 审计和来源事件幂等 | PK `source_event_id`；INDEX `(user_id,created_at desc)` |
 | `settlements` | 60 万/期 | 冻结最终名次、段位变化 | PK `(period_id,user_id)` |
-| `reward_claims` | 最多 300 万总量 | 奖励领取记录及快照 | PK `(user_id,tier)`，从结构上保证只能领取一次 |
+| `reward_grants` | 最多 300 万总量 | 待发/已发奖励单及快照 | UNIQUE `(user_id,tier)`，从结构上保证只能发一次 |
+| `reward_deliveries` | 最多 300 万总量 | 示例奖励系统的幂等交付记录 | PK `idempotency_key` |
 
 ## 为什么分开保存积分
 
@@ -38,7 +39,7 @@
 - `period_members`、`period_scores`、`settlements`：按 `period_id` 保留，数据持续增长后按周期归档。
 - `daily_scores`：只服务近期限额判断，建议保留 30～90 天后归档。
 - `score_events`：数据量最大；生产环境建议按月分区，并根据审计要求保留 3～6 个月。
-- `reward_claims`：长期保留，不可随周期删除。
+- `reward_grants`、`reward_deliveries`：长期保留，不可随周期删除。
 
 ## 并发与幂等
 
