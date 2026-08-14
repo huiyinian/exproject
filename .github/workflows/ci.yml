@@ -29,3 +29,7 @@ jobs:
         env:
           PGPASSWORD: contest
         run: psql -h localhost -U contest -d contest -v ON_ERROR_STOP=1 -f migrations/001_init.sql
+      - name: Run weekly contest integration workflow
+        env:
+          PGPASSWORD: contest
+        run: psql -h localhost -U contest -d contest -v ON_ERROR_STOP=1 -f tests/integration/workflow.sql
