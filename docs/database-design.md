@@ -28,6 +28,8 @@
 
 `score_events` 是不可变流水，用于幂等、审计和问题追踪；`daily_scores` 用于校验渠道上限与总上限；`period_scores` 用于排行榜。查询排行榜不扫描流水，写入时三者在同一事务更新，因此逻辑直接且可恢复。
 
+排行榜查询的索引路径：当前榜先通过 `period_members(user_id,period_id)` 找到用户所在组，再利用 `UNIQUE(group_id,user_id)` 读取最多 50 名组员，并通过 `period_scores(period_id,user_id)` 回表取分数。上期结算榜通过 `settlements(user_id,period_id desc)` 找最近一期，再通过 `settlements(period_id,group_id,rank,user_id)` 按名次顺序读取整组结果。
+
 ## 60 万用户下的处理方式
 
 开赛分组使用窗口函数按 `tier,id` 稳定排序，再用 `ceil(row_number/50)` 生成组号。数据库一次批量生成约 1.2 万组和 60 万成员，禁止在 Go 中循环逐条插入。生产调度应在开赛前进入准备阶段完成分组，周一 12:00 只切换状态。
