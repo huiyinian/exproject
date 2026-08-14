@@ -1,7 +1,11 @@
 begin;
 
+-- User profile and configurable business rules.
+
 create table users (
   id bigint primary key,
+  -- stage is mutable user profile data; every period copies it into period_members.
+  stage smallint not null default 0 check(stage>=0),
   tier smallint not null default 1 check (tier between 1 and 5),
   highest_tier smallint not null default 1 check (highest_tier between 1 and 5),
   created_at timestamptz not null default now()
@@ -24,6 +28,7 @@ insert into tier_rules values
  (3,60,'{"name":"tier-3 reward"}'),(4,50,'{"name":"tier-4 reward"}'),
  (5,40,'{"name":"tier-5 reward"}');
 
+-- Period, grouping, and frozen membership data.
 create table periods (
   id bigint generated always as identity primary key,
   starts_at timestamptz not null unique,
@@ -40,12 +45,19 @@ create table period_groups (
 create table period_members (
   period_id bigint not null references periods(id), group_id bigint not null references period_groups(id),
   user_id bigint not null references users(id), tier smallint not null,
+  -- Frozen stage: later profile changes must not rewrite historical periods.
+  stage smallint not null,
   primary key(period_id,user_id), unique(group_id,user_id)
 );
 create table period_scores (
   period_id bigint not null references periods(id), user_id bigint not null references users(id),
-  score bigint not null default 0 check(score>=0), primary key(period_id,user_id)
+  score bigint not null default 0 check(score>=0),
+  -- Server time when the user most recently reached the current score.
+  reached_at timestamptz,
+  primary key(period_id,user_id)
 );
+-- Score ledger plus daily and weekly aggregates. Leaderboards never scan the
+-- high-volume score_events table.
 create table daily_scores (
   user_id bigint not null references users(id), score_date date not null,
   channel text not null references channel_rules(channel), score integer not null default 0,
@@ -58,14 +70,18 @@ create table score_events (
 );
 create index idx_score_events_user_created on score_events(user_id,created_at desc);
 create index idx_period_members_user_period on period_members(user_id,period_id desc);
+-- Immutable settlement snapshots support historical group leaderboards.
 create table settlements (
   period_id bigint not null, user_id bigint not null, group_id bigint not null,
   rank integer not null, old_tier smallint not null, new_tier smallint not null,
-  final_score bigint not null, promoted boolean not null,
+  final_score bigint not null, reached_at timestamptz, stage smallint not null,
+  promoted boolean not null,
   primary key(period_id,user_id)
 );
 create index idx_settlements_user_period on settlements(user_id,period_id desc);
 create index idx_settlements_period_group_rank on settlements(period_id,group_id,rank,user_id);
+-- Reward grants are durable orders. reward_deliveries simulates an idempotent
+-- downstream reward provider in this standalone example.
 create table reward_grants (
   id bigint generated always as identity primary key,
   source_period_id bigint not null references periods(id),
@@ -85,6 +101,7 @@ create table reward_deliveries (
   reward_snapshot jsonb not null,
   delivered_at timestamptz not null default now()
 );
+-- Durable orchestration queue for settlement, regrouping, and rewards.
 create table period_jobs (
   id bigint generated always as identity primary key,
   job_key text not null unique,
@@ -100,6 +117,8 @@ create table period_jobs (
 );
 create index idx_period_jobs_claim on period_jobs(status,available_at,id);
 
+-- Atomically validates a score event and updates its immutable event row,
+-- daily counters, and current-period aggregate.
 create or replace function add_score(p_user bigint,p_channel text,p_points int,p_source_event text,p_duration_seconds int,p_now timestamptz) returns int language plpgsql as $$
 declare v_period bigint; v_channel_limit int; v_min_duration int; v_channel_used int; v_total_used int;
 begin
@@ -116,11 +135,13 @@ begin
   if v_channel_used+p_points>v_channel_limit then raise exception 'channel_daily_limit_exceeded'; end if;
   if v_total_used+p_points>500 then raise exception 'total_daily_limit_exceeded'; end if;
   insert into daily_scores values(p_user,(p_now at time zone 'Asia/Shanghai')::date,p_channel,p_points) on conflict(user_id,score_date,channel) do update set score=daily_scores.score+excluded.score;
-  insert into period_scores values(v_period,p_user,p_points) on conflict(period_id,user_id) do update set score=period_scores.score+excluded.score;
+  insert into period_scores(period_id,user_id,score,reached_at) values(v_period,p_user,p_points,p_now)
+  on conflict(period_id,user_id) do update set score=period_scores.score+excluded.score,reached_at=excluded.reached_at;
   insert into score_events values(p_source_event,p_user,v_period,p_channel,p_points,p_duration_seconds,p_now);
   return p_points;
 end $$;
 
+-- Creates the next empty period before noon without doing any heavy work.
 create or replace function prepare_next_period(p_now timestamptz) returns bigint language plpgsql as $$
 declare v_start timestamptz; v_period bigint; v_previous bigint;
 begin
@@ -131,6 +152,7 @@ begin
   return v_period;
 end $$;
 
+-- Performs the lightweight Monday-noon boundary switch and enqueues settlement.
 create or replace function rollover_period(p_now timestamptz) returns table(old_period_id bigint,new_period_id bigint) language plpgsql as $$
 declare v_start timestamptz;
 begin
@@ -153,16 +175,17 @@ begin
   return next;
 end $$;
 
+-- Settles one tier independently. Ranking is score DESC, reached_at ASC, uid ASC.
 create or replace function settle_period_tier(p_period bigint,p_tier int) returns void language plpgsql as $$
 begin
-  insert into settlements(period_id,user_id,group_id,rank,old_tier,new_tier,final_score,promoted)
-  select period_id,user_id,group_id,rn,old_tier,case when promoted then least(5,old_tier+1) else greatest(1,old_tier-1) end,score,promoted from (
+  insert into settlements(period_id,user_id,group_id,rank,old_tier,new_tier,final_score,reached_at,stage,promoted)
+  select period_id,user_id,group_id,rn,old_tier,case when promoted then least(5,old_tier+1) else greatest(1,old_tier-1) end,score,reached_at,stage,promoted from (
     select x.*,rn<=ceil(cnt*promotion_percent/100.0) promoted from (
       select m.period_id,m.user_id,m.group_id,m.tier old_tier,coalesce(s.score,0) score,r.promotion_percent,
-      row_number() over(partition by m.group_id order by coalesce(s.score,0) desc,m.user_id) rn,count(*) over(partition by m.group_id) cnt
+      s.reached_at,m.stage,row_number() over(partition by m.group_id order by coalesce(s.score,0) desc,s.reached_at asc nulls last,m.user_id) rn,count(*) over(partition by m.group_id) cnt
       from period_members m left join period_scores s using(period_id,user_id) join tier_rules r on r.tier=m.tier where m.period_id=p_period and m.tier=p_tier
     ) x
-  ) y on conflict(period_id,user_id) do update set rank=excluded.rank,final_score=excluded.final_score,new_tier=excluded.new_tier,promoted=excluded.promoted;
+  ) y on conflict(period_id,user_id) do update set rank=excluded.rank,final_score=excluded.final_score,reached_at=excluded.reached_at,stage=excluded.stage,new_tier=excluded.new_tier,promoted=excluded.promoted;
 end $$;
 
 create or replace function finalize_settlement(p_period bigint) returns void language plpgsql as $$
@@ -179,6 +202,7 @@ begin
   insert into period_jobs(job_key,period_id,job_type) values(p_period||':rewards',p_period,'create_rewards') on conflict do nothing;
 end $$;
 
+-- Backfills every reached tier that the user has never received before.
 create or replace function create_reward_grants(p_period bigint) returns void language plpgsql as $$
 begin
   insert into reward_grants(source_period_id,user_id,tier,idempotency_key,reward_snapshot)
@@ -188,6 +212,7 @@ begin
   insert into period_jobs(job_key,period_id,job_type) values(p_period||':dispatch:initial',p_period,'dispatch_rewards') on conflict do nothing;
 end $$;
 
+-- Dispatches at most 1000 rewards per transaction to bound lock and WAL volume.
 create or replace function dispatch_reward_batch(p_period bigint) returns integer language plpgsql as $$
 declare v_count integer;
 begin
@@ -204,12 +229,13 @@ begin
   return v_count;
 end $$;
 
+-- Creates deterministic-but-different-per-period groups and freezes stage/tier.
 create or replace function create_period_groups(p_period bigint) returns void language plpgsql as $$
 begin
   insert into period_groups(period_id,tier,group_no)
   select p_period,tier,grp from (select tier,ceil(row_number() over(partition by tier order by hashtextextended(id::text,p_period))/50.0)::int grp from users) x group by tier,grp on conflict do nothing;
-  insert into period_members(period_id,group_id,user_id,tier)
-  select p_period,g.id,u.id,u.tier from (select id,tier,ceil(row_number() over(partition by tier order by hashtextextended(id::text,p_period))/50.0)::int grp from users) u join period_groups g on g.period_id=p_period and g.tier=u.tier and g.group_no=u.grp on conflict do nothing;
+  insert into period_members(period_id,group_id,user_id,tier,stage)
+  select p_period,g.id,u.id,u.tier,u.stage from (select id,tier,stage,ceil(row_number() over(partition by tier order by hashtextextended(id::text,p_period))/50.0)::int grp from users) u join period_groups g on g.period_id=p_period and g.tier=u.tier and g.group_no=u.grp on conflict do nothing;
   insert into period_jobs(job_key,period_id,job_type) values(p_period||':activate',p_period,'activate_period') on conflict do nothing;
 end $$;
 
