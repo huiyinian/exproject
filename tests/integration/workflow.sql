@@ -46,6 +46,21 @@ select p.id,u.id,1000-u.id from periods p cross join users u
 where p.starts_at='2026-08-10 12:00:00+08'
 on conflict(period_id,user_id) do update set score=excluded.score;
 
+-- Pick two users from the same group and force a score tie. The earlier
+-- reached_at must win even when its user_id is larger.
+do $$
+declare v_period bigint; v_group bigint; v_early bigint; v_late bigint;
+begin
+  select id into v_period from periods where starts_at='2026-08-10 12:00:00+08';
+  select group_id into v_group from period_members where period_id=v_period order by group_id limit 1;
+  select max(user_id),min(user_id) into v_early,v_late from (select user_id from period_members where period_id=v_period and group_id=v_group order by user_id limit 2) x;
+  update period_scores set score=2000,reached_at='2026-08-10 12:10:00+08' where period_id=v_period and user_id=v_early;
+  update period_scores set score=2000,reached_at='2026-08-10 12:11:00+08' where period_id=v_period and user_id=v_late;
+end $$;
+
+-- Profile data may change, but the old period keeps its frozen stage.
+update users set stage=2;
+
 -- Prepare before noon, then perform the lightweight 12:00 rollover.
 select prepare_next_period('2026-08-17 11:30:00+08');
 select * from rollover_period('2026-08-17 12:00:00+08');
@@ -75,6 +90,8 @@ begin
   select count(*) filter(where tier=2),count(*) filter(where tier=1) into v_tier2,v_tier1 from users;
   if v_settled<>100 then raise exception 'settlement count %, want 100',v_settled; end if;
   if v_tier2<>80 or v_tier1<>20 then raise exception 'tier result wrong: tier2 %, tier1 %',v_tier2,v_tier1; end if;
+  if exists(select 1 from settlements where period_id=v_old and stage<>0) then raise exception 'settlement did not preserve frozen stage'; end if;
+  if exists(select 1 from (select group_id,rank,reached_at,user_id,lag(reached_at) over(partition by group_id order by rank) previous_reached from settlements where period_id=v_old and final_score=2000) x where rank=2 and reached_at<previous_reached) then raise exception 'reached_at tie order is wrong'; end if;
 end $$;
 
 -- Generate each reached-tier reward once and dispatch all pending batches.
@@ -108,6 +125,7 @@ begin
   select count(*) into v_members from period_members where period_id=v_new;
   select max(c) into v_max_group from (select count(*) c from period_members where period_id=v_new group by group_id) x;
   if v_members<>100 or v_max_group>50 then raise exception 'regroup failed: members %, max group %',v_members,v_max_group; end if;
+  if exists(select 1 from period_members where period_id=v_new and stage<>2) then raise exception 'new period did not freeze current stage'; end if;
   if (select status from periods where id=v_new)<>'active' then raise exception 'new period not active'; end if;
 end $$;
 
