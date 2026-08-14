@@ -7,6 +7,8 @@ import (
 )
 
 const (
+	// Tier boundaries are deliberately fixed in the domain because settlement
+	// must never create a tier outside the configured five-tier ladder.
 	MinTier = 1
 	MaxTier = 5
 	GroupSize = 50
@@ -19,6 +21,7 @@ var (
 	ErrDailyLimit = errors.New("total daily limit exceeded")
 )
 
+// Channel describes one score source and its independent daily cap.
 type Channel struct { Name string; DailyLimit int }
 
 type ScoreUsage struct { ChannelPoints, TotalPoints int }
@@ -41,13 +44,22 @@ func PeriodAt(now time.Time, loc *time.Location) (start, end time.Time) {
 
 var promotionPercent = map[int]int{1: 80, 2: 70, 3: 60, 4: 50, 5: 40}
 
-type Standing struct { UserID int64; Score int64 }
+// Standing is the frozen input used to rank one group. ReachedAt is the time at
+// which the user reached Score; earlier achievement wins a score tie.
+type Standing struct { UserID int64; Score int64; ReachedAt time.Time }
 type Settlement struct { UserID int64; Rank, OldTier, NewTier int; Promoted bool }
 
+// Settle sorts a single group and applies the promotion ratio for its old tier.
+// The stable order is score DESC, reached_at ASC, user_id ASC.
 func Settle(tier int, standings []Standing) []Settlement {
 	if tier < MinTier { tier = MinTier }; if tier > MaxTier { tier = MaxTier }
 	sort.SliceStable(standings, func(i, j int) bool {
-		if standings[i].Score == standings[j].Score { return standings[i].UserID < standings[j].UserID }
+		if standings[i].Score == standings[j].Score {
+			a,b:=standings[i].ReachedAt,standings[j].ReachedAt
+			if a.IsZero()!=b.IsZero() { return !a.IsZero() }
+			if !a.Equal(b) { return a.Before(b) }
+			return standings[i].UserID < standings[j].UserID
+		}
 		return standings[i].Score > standings[j].Score
 	})
 	promoteCount := (len(standings)*promotionPercent[tier] + 99) / 100
