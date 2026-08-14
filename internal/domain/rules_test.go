@@ -30,3 +30,14 @@ func TestSettle(t *testing.T) {
 	for i := 0; i < 7; i++ { if got[i].NewTier != 3 { t.Fatalf("rank %d should promote", i+1) } }
 	for i := 7; i < 10; i++ { if got[i].NewTier != 1 { t.Fatalf("rank %d should demote", i+1) } }
 }
+
+func TestSettleTieBreaksByReachedAtThenUserID(t *testing.T) {
+	base:=time.Date(2026,8,10,12,0,0,0,time.UTC)
+	rows:=[]Standing{
+		{UserID:3,Score:100,ReachedAt:base.Add(time.Minute)},
+		{UserID:2,Score:100,ReachedAt:base},
+		{UserID:1,Score:100,ReachedAt:base},
+	}
+	got:=Settle(1,rows)
+	if got[0].UserID!=1||got[1].UserID!=2||got[2].UserID!=3 { t.Fatalf("unexpected tie order: %+v",got) }
+}
