@@ -64,16 +64,30 @@ create table settlements (
   final_score bigint not null, promoted boolean not null,
   primary key(period_id,user_id)
 );
-create table reward_claims (
-  user_id bigint not null references users(id), tier smallint not null references tier_rules(tier),
-  reward_snapshot jsonb not null, claimed_at timestamptz not null default now(),
-  primary key(user_id,tier)
+create table reward_grants (
+  id bigint generated always as identity primary key,
+  source_period_id bigint not null references periods(id),
+  user_id bigint not null references users(id),
+  tier smallint not null references tier_rules(tier),
+  idempotency_key text not null unique,
+  reward_snapshot jsonb not null,
+  status text not null default 'pending' check(status in('pending','succeeded')),
+  created_at timestamptz not null default now(),
+  delivered_at timestamptz,
+  unique(user_id,tier)
+);
+create index idx_reward_grants_dispatch on reward_grants(source_period_id,status,id);
+create table reward_deliveries (
+  idempotency_key text primary key,
+  user_id bigint not null,
+  reward_snapshot jsonb not null,
+  delivered_at timestamptz not null default now()
 );
 create table period_jobs (
   id bigint generated always as identity primary key,
   job_key text not null unique,
   period_id bigint not null references periods(id),
-  job_type text not null check(job_type in('settle_tier','finalize_settlement','create_groups','activate_period')),
+  job_type text not null check(job_type in('settle_tier','finalize_settlement','create_groups','activate_period','create_rewards','dispatch_rewards')),
   payload jsonb not null default '{}',
   status text not null default 'pending' check(status in('pending','running','succeeded')),
   retry_count integer not null default 0,
@@ -160,6 +174,32 @@ begin
   select id into v_next from periods where previous_period_id=p_period;
   if v_next is null then raise exception 'next_period_not_found'; end if;
   insert into period_jobs(job_key,period_id,job_type) values(v_next||':groups',v_next,'create_groups') on conflict do nothing;
+  insert into period_jobs(job_key,period_id,job_type) values(p_period||':rewards',p_period,'create_rewards') on conflict do nothing;
+end $$;
+
+create or replace function create_reward_grants(p_period bigint) returns void language plpgsql as $$
+begin
+  insert into reward_grants(source_period_id,user_id,tier,idempotency_key,reward_snapshot)
+  select p_period,s.user_id,r.tier,'weekly-tier:'||s.user_id||':'||r.tier,r.reward
+  from settlements s join tier_rules r on r.tier<=s.new_tier where s.period_id=p_period
+  on conflict(user_id,tier) do nothing;
+  insert into period_jobs(job_key,period_id,job_type) values(p_period||':dispatch:initial',p_period,'dispatch_rewards') on conflict do nothing;
+end $$;
+
+create or replace function dispatch_reward_batch(p_period bigint) returns integer language plpgsql as $$
+declare v_count integer;
+begin
+  with batch as (
+    select id,idempotency_key,user_id,reward_snapshot from reward_grants
+    where source_period_id=p_period and status='pending' order by id for update skip locked limit 1000
+  ), delivered as (
+    insert into reward_deliveries(idempotency_key,user_id,reward_snapshot)
+    select idempotency_key,user_id,reward_snapshot from batch on conflict do nothing returning idempotency_key
+  )
+  update reward_grants g set status='succeeded',delivered_at=now()
+  where g.id in(select id from batch);
+  get diagnostics v_count=row_count;
+  return v_count;
 end $$;
 
 create or replace function create_period_groups(p_period bigint) returns void language plpgsql as $$
@@ -182,7 +222,7 @@ end $$;
 
 create or replace function claim_period_job() returns table(id bigint,period_id bigint,job_type text,payload jsonb) language plpgsql as $$
 begin
-  return query update period_jobs j set status='running',updated_at=now() where j.id=(select x.id from period_jobs x where x.status='pending' and x.available_at<=now() order by x.id for update skip locked limit 1) returning j.id,j.period_id,j.job_type,j.payload;
+  return query update period_jobs j set status='running',updated_at=now() where j.id=(select x.id from period_jobs x where (x.status='pending' and x.available_at<=now()) or (x.status='running' and x.updated_at<now()-interval '5 minutes') order by x.id for update skip locked limit 1) returning j.id,j.period_id,j.job_type,j.payload;
 end $$;
 
 create or replace function complete_period_job(p_job bigint) returns void language plpgsql as $$
@@ -192,6 +232,9 @@ begin
   if v_type='settle_tier' then
     select count(*) into v_remaining from period_jobs where period_id=v_period and job_type='settle_tier' and status<>'succeeded';
     if v_remaining=0 then insert into period_jobs(job_key,period_id,job_type) values(v_period||':finalize',v_period,'finalize_settlement') on conflict do nothing; end if;
+  end if;
+  if v_type='dispatch_rewards' and exists(select 1 from reward_grants where source_period_id=v_period and status='pending') then
+    insert into period_jobs(job_key,period_id,job_type) values(v_period||':dispatch:'||p_job,v_period,'dispatch_rewards') on conflict do nothing;
   end if;
 end $$;
 commit;
