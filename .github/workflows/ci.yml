@@ -3,6 +3,20 @@ on: [push, pull_request]
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: contest
+          POSTGRES_PASSWORD: contest
+          POSTGRES_DB: contest
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U contest"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -11,3 +25,7 @@ jobs:
       - run: go mod tidy -diff
       - run: go test ./...
       - run: go vet ./...
+      - name: Validate PostgreSQL migration
+        env:
+          PGPASSWORD: contest
+        run: psql -h localhost -U contest -d contest -v ON_ERROR_STOP=1 -f migrations/001_init.sql
