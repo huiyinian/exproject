@@ -37,6 +37,10 @@ func (a *App) RunOneJob(ctx context.Context) (bool, error) {
 		_,runErr=a.db.Exec(ctx,"select create_period_groups($1)",job.PeriodID)
 	case "activate_period":
 		_,runErr=a.db.Exec(ctx,"select activate_period($1)",job.PeriodID)
+	case "create_rewards":
+		_,runErr=a.db.Exec(ctx,"select create_reward_grants($1)",job.PeriodID)
+	case "dispatch_rewards":
+		_,runErr=a.db.Exec(ctx,"select dispatch_reward_batch($1)",job.PeriodID)
 	default:
 		runErr=fmt.Errorf("unknown job type %q",job.JobType)
 	}
