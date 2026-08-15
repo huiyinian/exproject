@@ -78,9 +78,18 @@ begin
 end $$;
 
 -- Run settlement business functions. Tier 1 has two groups of 50, so 80 users promote.
-select settle_period_tier((select id from periods where starts_at='2026-08-10 12:00:00+08'),tier)
-from generate_series(1,5) tier;
+select settle_period_groups(
+  (select id from periods where starts_at='2026-08-10 12:00:00+08'),
+  (select min(id) from period_groups where period_id=(select id from periods where starts_at='2026-08-10 12:00:00+08')),
+  (select max(id) from period_groups where period_id=(select id from periods where starts_at='2026-08-10 12:00:00+08'))
+);
 select finalize_settlement((select id from periods where starts_at='2026-08-10 12:00:00+08'));
+select apply_settlement_groups(
+  (select id from periods where starts_at='2026-08-10 12:00:00+08'),
+  (select min(id) from period_groups where period_id=(select id from periods where starts_at='2026-08-10 12:00:00+08')),
+  (select max(id) from period_groups where period_id=(select id from periods where starts_at='2026-08-10 12:00:00+08'))
+);
+select finish_settlement((select id from periods where starts_at='2026-08-10 12:00:00+08'));
 
 do $$
 declare v_old bigint; v_settled bigint; v_tier2 bigint; v_tier1 bigint;
