@@ -14,6 +14,7 @@ services:
     environment:
       DATABASE_URL: postgres://contest:contest@postgres:5432/contest?sslmode=disable
       APP_TIMEZONE: Asia/Shanghai
+      INTERNAL_TOKEN: local-development-token
     ports: ["8080:8080"]
     depends_on:
       postgres: {condition: service_healthy}
@@ -23,5 +24,6 @@ services:
     environment:
       DATABASE_URL: postgres://contest:contest@postgres:5432/contest?sslmode=disable
       APP_TIMEZONE: Asia/Shanghai
+      INTERNAL_TOKEN: local-development-token
     depends_on:
       postgres: {condition: service_healthy}
