@@ -13,22 +13,22 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-type Config struct { HTTPAddr, DatabaseURL string; Location *time.Location }
+type Config struct { HTTPAddr, DatabaseURL, InternalToken string; Location *time.Location }
 
 func LoadConfig() (Config, error) {
 	url := os.Getenv("DATABASE_URL"); if url == "" { return Config{}, errors.New("DATABASE_URL is required") }
 	tz := os.Getenv("APP_TIMEZONE"); if tz == "" { tz = "Asia/Shanghai" }
 	loc, err := time.LoadLocation(tz); if err != nil { return Config{}, fmt.Errorf("load timezone: %w", err) }
 	addr := os.Getenv("HTTP_ADDR"); if addr == "" { addr = ":8080" }
-	return Config{HTTPAddr:addr, DatabaseURL:url, Location:loc}, nil
+	return Config{HTTPAddr:addr, DatabaseURL:url, InternalToken:os.Getenv("INTERNAL_TOKEN"), Location:loc}, nil
 }
 
-type App struct { db *pgxpool.Pool; loc *time.Location }
+type App struct { db *pgxpool.Pool; loc *time.Location; internalToken string }
 
 func New(ctx context.Context, cfg Config) (*App, error) {
 	db, err := pgxpool.New(ctx, cfg.DatabaseURL); if err != nil { return nil, err }
 	if err := db.Ping(ctx); err != nil { db.Close(); return nil, err }
-	return &App{db:db, loc:cfg.Location}, nil
+	return &App{db:db, loc:cfg.Location, internalToken:cfg.InternalToken}, nil
 }
 func (a *App) Close() { a.db.Close() }
 func (a *App) Handler() http.Handler {
@@ -37,18 +37,29 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/scores", a.addScore)
 	mux.HandleFunc("GET /v1/leaderboard", a.leaderboard)
 	mux.HandleFunc("GET /v1/settlements/previous", a.previousSettlementLeaderboard)
-	mux.HandleFunc("POST /internal/periods/prepare", a.preparePeriod)
-	mux.HandleFunc("POST /internal/periods/rollover", a.rolloverPeriod)
-	mux.HandleFunc("POST /internal/jobs/run-once", a.runJobOnce)
+	// 周期切换和任务执行属于高风险运维操作，必须通过内部 Token 鉴权。
+	mux.Handle("POST /internal/periods/prepare", a.requireInternal(http.HandlerFunc(a.preparePeriod)))
+	mux.Handle("POST /internal/periods/rollover", a.requireInternal(http.HandlerFunc(a.rolloverPeriod)))
+	mux.Handle("POST /internal/jobs/run-once", a.requireInternal(http.HandlerFunc(a.runJobOnce)))
 	return mux
+}
+
+// requireInternal 保护会改变周期或任务状态的内部接口。
+// 未配置 Token 时直接返回 503，避免误把无鉴权接口部署到生产环境。
+func (a *App) requireInternal(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter,r *http.Request){
+		if a.internalToken=="" { writeError(w,http.StatusServiceUnavailable,"internal_api_disabled"); return }
+		if r.Header.Get("Authorization")!="Bearer "+a.internalToken { writeError(w,http.StatusUnauthorized,"unauthorized"); return }
+		next.ServeHTTP(w,r)
+	})
 }
 
 func (a *App) addScore(w http.ResponseWriter, r *http.Request) {
 	var in struct { UserID int64 `json:"user_id"`; Channel string `json:"channel"`; Points int `json:"points"`; SourceEventID string `json:"source_event_id"`; DurationSeconds int `json:"duration_seconds"` }
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil || in.UserID <= 0 || in.Channel == "" || in.SourceEventID == "" { writeError(w, 400, "invalid_request"); return }
 	var accepted int
-	// The database function owns validation and all counter updates so concurrent
-	// requests cannot partially update daily and weekly totals.
+	// 校验、每日累计和周期累计由同一个数据库函数完成，避免并发请求只更新
+	// 部分数据，或者同时读取旧值后突破每日积分上限。
 	err := a.db.QueryRow(r.Context(), "select add_score($1,$2,$3,$4,$5,$6)", in.UserID, in.Channel, in.Points, in.SourceEventID, in.DurationSeconds, time.Now().In(a.loc)).Scan(&accepted)
 	if err != nil { writeError(w, 409, err.Error()); return }
 	writeJSON(w, 200, map[string]int{"accepted_points":accepted})
