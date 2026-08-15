@@ -7,8 +7,7 @@ import (
 )
 
 const (
-	// Tier boundaries are deliberately fixed in the domain because settlement
-	// must never create a tier outside the configured five-tier ladder.
+	// 段位上下界属于核心业务约束，结算结果不能超出 1～5 级。
 	MinTier = 1
 	MaxTier = 5
 	GroupSize = 50
@@ -21,7 +20,7 @@ var (
 	ErrDailyLimit = errors.New("total daily limit exceeded")
 )
 
-// Channel describes one score source and its independent daily cap.
+// Channel 表示一个积分渠道及该渠道独立的每日上限。
 type Channel struct { Name string; DailyLimit int }
 
 type ScoreUsage struct { ChannelPoints, TotalPoints int }
@@ -33,7 +32,7 @@ func ValidateScore(usage ScoreUsage, channel Channel, points int) error {
 	return nil
 }
 
-// PeriodAt returns a Monday 12:00 [start,end) period in loc.
+// PeriodAt 根据指定时区计算当前周赛周期，范围为周一 12:00 左闭右开。
 func PeriodAt(now time.Time, loc *time.Location) (start, end time.Time) {
 	n := now.In(loc)
 	daysSinceMonday := (int(n.Weekday()) + 6) % 7
@@ -44,13 +43,13 @@ func PeriodAt(now time.Time, loc *time.Location) (start, end time.Time) {
 
 var promotionPercent = map[int]int{1: 80, 2: 70, 3: 60, 4: 50, 5: 40}
 
-// Standing is the frozen input used to rank one group. ReachedAt is the time at
-// which the user reached Score; earlier achievement wins a score tie.
+// Standing 是小组结算时的冻结排名数据。
+// ReachedAt 表示达到当前积分的时间，同分时更早达到者排名更高。
 type Standing struct { UserID int64; Score int64; ReachedAt time.Time }
 type Settlement struct { UserID int64; Rank, OldTier, NewTier int; Promoted bool }
 
-// Settle sorts a single group and applies the promotion ratio for its old tier.
-// The stable order is score DESC, reached_at ASC, user_id ASC.
+// Settle 对单个小组排名，并根据原段位的晋升比例计算新段位。
+// 排序规则固定为：积分降序、达到时间升序、用户 ID 升序。
 func Settle(tier int, standings []Standing) []Settlement {
 	if tier < MinTier { tier = MinTier }; if tier > MaxTier { tier = MaxTier }
 	sort.SliceStable(standings, func(i, j int) bool {
