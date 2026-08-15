@@ -1,0 +1,29 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: contest
+      POSTGRES_PASSWORD: contest
+      POSTGRES_DB: contest
+    ports: ["5432:5432"]
+    healthcheck: {test: ["CMD-SHELL", "pg_isready -U contest"], interval: 2s, timeout: 2s, retries: 20}
+    volumes:
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+  api:
+    build: .
+    environment:
+      DATABASE_URL: postgres://contest:contest@postgres:5432/contest?sslmode=disable
+      APP_TIMEZONE: Asia/Shanghai
+      INTERNAL_TOKEN: local-development-token
+    ports: ["8080:8080"]
+    depends_on:
+      postgres: {condition: service_healthy}
+  worker:
+    build: .
+    entrypoint: ["/weekly-worker"]
+    environment:
+      DATABASE_URL: postgres://contest:contest@postgres:5432/contest?sslmode=disable
+      APP_TIMEZONE: Asia/Shanghai
+      INTERNAL_TOKEN: local-development-token
+    depends_on:
+      postgres: {condition: service_healthy}
