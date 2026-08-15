@@ -27,13 +27,15 @@ docker compose up --build
 
 API 与 Worker 分开运行。Worker 每分钟幂等检查周期：提前创建 `preparing` 周期；周一 12:00 后把旧周期切到 `settling`，新周期立即开始收分，再异步完成五个段位结算、更新段位、分组和激活。内部接口应增加生产鉴权。
 
+所有 `/internal/*` 接口都要求 `Authorization: Bearer <INTERNAL_TOKEN>`。未配置 `INTERNAL_TOKEN` 时内部接口自动禁用；示例 Compose 中的 Token 只能用于本地开发。
+
 ```sql
 insert into users(id) select generate_series(1,120);
 ```
 
 ```bash
-curl -X POST localhost:8080/internal/periods/prepare
-curl -X POST localhost:8080/internal/periods/rollover
+curl -X POST localhost:8080/internal/periods/prepare -H 'Authorization: Bearer local-development-token'
+curl -X POST localhost:8080/internal/periods/rollover -H 'Authorization: Bearer local-development-token'
 curl -X POST localhost:8080/v1/scores -H 'content-type: application/json' \
   -d '{"user_id":1,"channel":"channel_a","points":100,"source_event_id":"event-1","duration_seconds":180}'
 curl 'localhost:8080/v1/leaderboard?user_id=1'
