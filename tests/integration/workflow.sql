@@ -2,7 +2,7 @@
 
 insert into users(id) select generate_series(1,100);
 
--- Bootstrap the first period, create two 50-person groups, and activate it.
+-- 初始化首个周期，创建两个 50 人小组并激活周期。
 select * from rollover_period('2026-08-10 12:00:00+08');
 select create_period_groups((select id from periods where starts_at='2026-08-10 12:00:00+08'));
 select activate_period((select id from periods where starts_at='2026-08-10 12:00:00+08'));
@@ -16,7 +16,7 @@ begin
   if v_groups<>2 or v_members<>100 then raise exception 'bootstrap grouping failed: groups %, members %',v_groups,v_members; end if;
 end $$;
 
--- Score API database contract: duration, idempotency, channel cap, and total cap.
+-- 验证加分规则：行为时长、事件幂等、渠道上限和每日总上限。
 do $$
 declare v_result integer;
 begin
@@ -40,14 +40,13 @@ begin
   end;
 end $$;
 
--- Give every user a deterministic score so settlement order is testable.
+-- 为每个用户生成确定积分，使结算结果可以重复验证。
 insert into period_scores(period_id,user_id,score)
 select p.id,u.id,1000-u.id from periods p cross join users u
 where p.starts_at='2026-08-10 12:00:00+08'
 on conflict(period_id,user_id) do update set score=excluded.score;
 
--- Pick two users from the same group and force a score tie. The earlier
--- reached_at must win even when its user_id is larger.
+-- 在同组选择两个用户制造同分；即使更早达到者 UID 更大，也必须排在前面。
 do $$
 declare v_period bigint; v_group bigint; v_early bigint; v_late bigint;
 begin
@@ -58,10 +57,10 @@ begin
   update period_scores set score=2000,reached_at='2026-08-10 12:11:00+08' where period_id=v_period and user_id=v_late;
 end $$;
 
--- Profile data may change, but the old period keeps its frozen stage.
+-- 修改用户当前学段，旧周期中的冻结学段必须保持不变。
 update users set stage=2;
 
--- Prepare before noon, then perform the lightweight 12:00 rollover.
+-- 12:00 前准备新周期，然后执行整点轻量切换。
 select prepare_next_period('2026-08-17 11:30:00+08');
 select * from rollover_period('2026-08-17 12:00:00+08');
 
@@ -77,7 +76,7 @@ begin
   if v_new_score_period<>v_new then raise exception '12:00 event assigned to wrong period'; end if;
 end $$;
 
--- Run settlement business functions. Tier 1 has two groups of 50, so 80 users promote.
+-- 执行结算。段位 1 有两个 50 人小组，因此总计 80 人晋升。
 select settle_period_groups(
   (select id from periods where starts_at='2026-08-10 12:00:00+08'),
   (select min(id) from period_groups where period_id=(select id from periods where starts_at='2026-08-10 12:00:00+08')),
@@ -103,7 +102,7 @@ begin
   if exists(select 1 from (select group_id,rank,reached_at,user_id,lag(reached_at) over(partition by group_id order by rank) previous_reached from settlements where period_id=v_old and final_score=2000) x where rank=2 and reached_at<previous_reached) then raise exception 'reached_at tie order is wrong'; end if;
 end $$;
 
--- Generate each reached-tier reward once and dispatch all pending batches.
+-- 生成一次性段位奖励，并分批发完所有待发奖励。
 select create_reward_grants((select id from periods where starts_at='2026-08-10 12:00:00+08'));
 select create_reward_grants((select id from periods where starts_at='2026-08-10 12:00:00+08'));
 do $$
@@ -123,7 +122,7 @@ begin
   if v_grants<>180 or v_deliveries<>180 then raise exception 'reward result wrong: grants %, deliveries %',v_grants,v_deliveries; end if;
 end $$;
 
--- Regroup using the settled tiers and expose the new leaderboard.
+-- 使用结算后的新段位重新分组，并开放新周期排行榜。
 select create_period_groups((select id from periods where starts_at='2026-08-17 12:00:00+08'));
 select activate_period((select id from periods where starts_at='2026-08-17 12:00:00+08'));
 
