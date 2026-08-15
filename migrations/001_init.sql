@@ -106,7 +106,7 @@ create table period_jobs (
   id bigint generated always as identity primary key,
   job_key text not null unique,
   period_id bigint not null references periods(id),
-  job_type text not null check(job_type in('settle_tier','finalize_settlement','create_groups','activate_period','create_rewards','dispatch_rewards')),
+  job_type text not null check(job_type in('settle_groups','finalize_settlement','apply_tier_groups','finish_settlement','create_groups','activate_period','create_rewards','dispatch_rewards')),
   payload jsonb not null default '{}',
   status text not null default 'pending' check(status in('pending','running','succeeded')),
   retry_count integer not null default 0,
@@ -152,7 +152,7 @@ begin
   return v_period;
 end $$;
 
--- Performs the lightweight Monday-noon boundary switch and enqueues settlement.
+-- 周一 12:00 只切换状态并生成结算批次，不在高峰期同步扫描 60 万用户。
 create or replace function rollover_period(p_now timestamptz) returns table(old_period_id bigint,new_period_id bigint) language plpgsql as $$
 declare v_start timestamptz;
 begin
@@ -169,32 +169,63 @@ begin
     return next; return;
   end if;
   update periods set status='settling' where id=old_period_id and status='active';
-  for i in 1..5 loop
-    insert into period_jobs(job_key,period_id,job_type,payload) values(old_period_id||':settle:'||i,old_period_id,'settle_tier',jsonb_build_object('tier',i)) on conflict do nothing;
-  end loop;
+  -- 每 100 个小组一个批次。每组最多 50 人，所以单事务最多处理约 5000 人。
+  -- available_at 延后 5 分钟，避开 12:00 整点的请求高峰。
+  insert into period_jobs(job_key,period_id,job_type,payload,available_at)
+  select old_period_id||':settle:'||batch_no,old_period_id,'settle_groups',
+         jsonb_build_object('min_group_id',min(id),'max_group_id',max(id)),p_now+interval '5 minutes'
+  from (
+    select id,((row_number() over(order by id)-1)/100)::integer batch_no
+    from period_groups where period_id=old_period_id
+  ) batches group by batch_no
+  on conflict do nothing;
   return next;
 end $$;
 
--- Settles one tier independently. Ranking is score DESC, reached_at ASC, uid ASC.
-create or replace function settle_period_tier(p_period bigint,p_tier int) returns void language plpgsql as $$
+-- 结算一批小组。批次边界使用全局唯一 group_id，默认最多写入约 5000 行。
+-- 排名规则：积分降序、达到时间升序、UID 升序。
+create or replace function settle_period_groups(p_period bigint,p_min_group bigint,p_max_group bigint) returns void language plpgsql as $$
 begin
   insert into settlements(period_id,user_id,group_id,rank,old_tier,new_tier,final_score,reached_at,stage,promoted)
   select period_id,user_id,group_id,rn,old_tier,case when promoted then least(5,old_tier+1) else greatest(1,old_tier-1) end,score,reached_at,stage,promoted from (
     select x.*,rn<=ceil(cnt*promotion_percent/100.0) promoted from (
       select m.period_id,m.user_id,m.group_id,m.tier old_tier,coalesce(s.score,0) score,r.promotion_percent,
       s.reached_at,m.stage,row_number() over(partition by m.group_id order by coalesce(s.score,0) desc,s.reached_at asc nulls last,m.user_id) rn,count(*) over(partition by m.group_id) cnt
-      from period_members m left join period_scores s using(period_id,user_id) join tier_rules r on r.tier=m.tier where m.period_id=p_period and m.tier=p_tier
+      from period_members m left join period_scores s using(period_id,user_id) join tier_rules r on r.tier=m.tier
+      where m.period_id=p_period and m.group_id between p_min_group and p_max_group
     ) x
   ) y on conflict(period_id,user_id) do update set rank=excluded.rank,final_score=excluded.final_score,reached_at=excluded.reached_at,stage=excluded.stage,new_tier=excluded.new_tier,promoted=excluded.promoted;
 end $$;
 
 create or replace function finalize_settlement(p_period bigint) returns void language plpgsql as $$
-declare v_next bigint; v_members bigint; v_settled bigint;
+declare v_members bigint; v_settled bigint;
 begin
   select count(*) into v_members from period_members where period_id=p_period;
   select count(*) into v_settled from settlements where period_id=p_period;
   if v_members<>v_settled then raise exception 'settlement_count_mismatch: members %, settled %',v_members,v_settled; end if;
-  update users u set tier=s.new_tier,highest_tier=greatest(u.highest_tier,s.new_tier) from settlements s where s.period_id=p_period and s.user_id=u.id;
+  -- 与结算相同，更新用户段位也按 100 个小组拆批，避免一次 UPDATE 60 万行。
+  insert into period_jobs(job_key,period_id,job_type,payload)
+  select p_period||':apply-tier:'||batch_no,p_period,'apply_tier_groups',
+         jsonb_build_object('min_group_id',min(id),'max_group_id',max(id))
+  from (
+    select id,((row_number() over(order by id)-1)/100)::integer batch_no
+    from period_groups where period_id=p_period
+  ) batches group by batch_no
+  on conflict do nothing;
+end $$;
+
+-- 分批把结算后的段位更新回用户表，单事务最多约 5000 名用户。
+create or replace function apply_settlement_groups(p_period bigint,p_min_group bigint,p_max_group bigint) returns void language plpgsql as $$
+begin
+  update users u set tier=s.new_tier,highest_tier=greatest(u.highest_tier,s.new_tier)
+  from settlements s
+  where s.period_id=p_period and s.group_id between p_min_group and p_max_group and s.user_id=u.id;
+end $$;
+
+-- 所有段位更新批次完成后，才结束旧周期并投递分组与奖励任务。
+create or replace function finish_settlement(p_period bigint) returns void language plpgsql as $$
+declare v_next bigint;
+begin
   update periods set status='finished' where id=p_period;
   select id into v_next from periods where previous_period_id=p_period;
   if v_next is null then raise exception 'next_period_not_found'; end if;
@@ -250,6 +281,8 @@ end $$;
 
 create or replace function claim_period_job() returns table(id bigint,period_id bigint,job_type text,payload jsonb) language plpgsql as $$
 begin
+  -- 全局锁把所有 Worker 实例的数据库重任务总并发限制为 1。
+  perform pg_advisory_xact_lock(861205);
   return query update period_jobs j set status='running',updated_at=now() where j.id=(select x.id from period_jobs x where (x.status='pending' and x.available_at<=now()) or (x.status='running' and x.updated_at<now()-interval '5 minutes') order by x.id for update skip locked limit 1) returning j.id,j.period_id,j.job_type,j.payload;
 end $$;
 
@@ -257,9 +290,13 @@ create or replace function complete_period_job(p_job bigint) returns void langua
 declare v_period bigint; v_type text; v_remaining int;
 begin
   update period_jobs set status='succeeded',last_error=null,updated_at=now() where id=p_job returning period_id,job_type into v_period,v_type;
-  if v_type='settle_tier' then
-    select count(*) into v_remaining from period_jobs where period_id=v_period and job_type='settle_tier' and status<>'succeeded';
+  if v_type='settle_groups' then
+    select count(*) into v_remaining from period_jobs where period_id=v_period and job_type='settle_groups' and status<>'succeeded';
     if v_remaining=0 then insert into period_jobs(job_key,period_id,job_type) values(v_period||':finalize',v_period,'finalize_settlement') on conflict do nothing; end if;
+  end if;
+  if v_type='apply_tier_groups' then
+    select count(*) into v_remaining from period_jobs where period_id=v_period and job_type='apply_tier_groups' and status<>'succeeded';
+    if v_remaining=0 then insert into period_jobs(job_key,period_id,job_type) values(v_period||':finish',v_period,'finish_settlement') on conflict do nothing; end if;
   end if;
   if v_type='dispatch_rewards' and exists(select 1 from reward_grants where source_period_id=v_period and status='pending') then
     insert into period_jobs(job_key,period_id,job_type) values(v_period||':dispatch:'||p_job,v_period,'dispatch_rewards') on conflict do nothing;
