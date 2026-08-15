@@ -25,7 +25,7 @@ func (a *App) RunOneJob(ctx context.Context) (bool, error) {
 	var job periodJob
 	err := a.db.QueryRow(ctx, `select id,period_id,job_type,payload from claim_period_job()`).Scan(&job.ID,&job.PeriodID,&job.JobType,&job.Payload)
 	if err != nil {
-		// claim_period_job returns no row when the queue is empty.
+		// 队列中没有可执行任务时，数据库函数不返回记录，这不属于异常。
 		if errors.Is(err,pgx.ErrNoRows) { return false,nil }
 		return false,err
 	}
