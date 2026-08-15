@@ -1,10 +1,10 @@
 begin;
 
--- User profile and configurable business rules.
+-- 用户资料和可配置的业务规则。
 
 create table users (
   id bigint primary key,
-  -- stage is mutable user profile data; every period copies it into period_members.
+  -- 学段属于可变化的用户资料，每个周期开始时复制到成员快照表。
   stage smallint not null default 0 check(stage>=0),
   tier smallint not null default 1 check (tier between 1 and 5),
   highest_tier smallint not null default 1 check (highest_tier between 1 and 5),
@@ -28,7 +28,7 @@ insert into tier_rules values
  (3,60,'{"name":"tier-3 reward"}'),(4,50,'{"name":"tier-4 reward"}'),
  (5,40,'{"name":"tier-5 reward"}');
 
--- Period, grouping, and frozen membership data.
+-- 周期、分组以及周期内不可变化的成员快照。
 create table periods (
   id bigint generated always as identity primary key,
   starts_at timestamptz not null unique,
@@ -45,19 +45,18 @@ create table period_groups (
 create table period_members (
   period_id bigint not null references periods(id), group_id bigint not null references period_groups(id),
   user_id bigint not null references users(id), tier smallint not null,
-  -- Frozen stage: later profile changes must not rewrite historical periods.
+  -- 冻结学段：用户后续修改资料不能覆盖本期和历史周期。
   stage smallint not null,
   primary key(period_id,user_id), unique(group_id,user_id)
 );
 create table period_scores (
   period_id bigint not null references periods(id), user_id bigint not null references users(id),
   score bigint not null default 0 check(score>=0),
-  -- Server time when the user most recently reached the current score.
+  -- 用户最近一次达到当前积分的服务端时间，用于同分排序。
   reached_at timestamptz,
   primary key(period_id,user_id)
 );
--- Score ledger plus daily and weekly aggregates. Leaderboards never scan the
--- high-volume score_events table.
+-- 积分流水、每日汇总和周期汇总。排行榜永远不扫描高数据量流水表。
 create table daily_scores (
   user_id bigint not null references users(id), score_date date not null,
   channel text not null references channel_rules(channel), score integer not null default 0,
@@ -70,7 +69,7 @@ create table score_events (
 );
 create index idx_score_events_user_created on score_events(user_id,created_at desc);
 create index idx_period_members_user_period on period_members(user_id,period_id desc);
--- Immutable settlement snapshots support historical group leaderboards.
+-- 不可变的结算快照，用于查询历史组内排行榜和追溯升降级结果。
 create table settlements (
   period_id bigint not null, user_id bigint not null, group_id bigint not null,
   rank integer not null, old_tier smallint not null, new_tier smallint not null,
@@ -80,8 +79,8 @@ create table settlements (
 );
 create index idx_settlements_user_period on settlements(user_id,period_id desc);
 create index idx_settlements_period_group_rank on settlements(period_id,group_id,rank,user_id);
--- Reward grants are durable orders. reward_deliveries simulates an idempotent
--- downstream reward provider in this standalone example.
+-- 奖励单是需要长期保存的业务凭证；reward_deliveries 在示例中模拟支持幂等的
+-- 下游奖励系统，接入真实服务后仍然沿用相同幂等键。
 create table reward_grants (
   id bigint generated always as identity primary key,
   source_period_id bigint not null references periods(id),
@@ -101,7 +100,7 @@ create table reward_deliveries (
   reward_snapshot jsonb not null,
   delivered_at timestamptz not null default now()
 );
--- Durable orchestration queue for settlement, regrouping, and rewards.
+-- 结算、更新段位、重新分组和奖励发放共用的持久化任务队列。
 create table period_jobs (
   id bigint generated always as identity primary key,
   job_key text not null unique,
@@ -117,8 +116,7 @@ create table period_jobs (
 );
 create index idx_period_jobs_claim on period_jobs(status,available_at,id);
 
--- Atomically validates a score event and updates its immutable event row,
--- daily counters, and current-period aggregate.
+-- 原子校验积分事件，并同时写入不可变流水、每日累计和当前周期累计。
 create or replace function add_score(p_user bigint,p_channel text,p_points int,p_source_event text,p_duration_seconds int,p_now timestamptz) returns int language plpgsql as $$
 declare v_period bigint; v_channel_limit int; v_min_duration int; v_channel_used int; v_total_used int;
 begin
@@ -141,7 +139,7 @@ begin
   return p_points;
 end $$;
 
--- Creates the next empty period before noon without doing any heavy work.
+-- 在 12:00 前提前创建新周期空记录，不执行任何大数据量操作。
 create or replace function prepare_next_period(p_now timestamptz) returns bigint language plpgsql as $$
 declare v_start timestamptz; v_period bigint; v_previous bigint;
 begin
@@ -233,7 +231,7 @@ begin
   insert into period_jobs(job_key,period_id,job_type) values(p_period||':rewards',p_period,'create_rewards') on conflict do nothing;
 end $$;
 
--- Backfills every reached tier that the user has never received before.
+-- 补齐用户已经达到、但历史上从未发放过的所有段位奖励。
 create or replace function create_reward_grants(p_period bigint) returns void language plpgsql as $$
 begin
   insert into reward_grants(source_period_id,user_id,tier,idempotency_key,reward_snapshot)
@@ -243,7 +241,7 @@ begin
   insert into period_jobs(job_key,period_id,job_type) values(p_period||':dispatch:initial',p_period,'dispatch_rewards') on conflict do nothing;
 end $$;
 
--- Dispatches at most 1000 rewards per transaction to bound lock and WAL volume.
+-- 每个事务最多发放 1000 条奖励，控制锁持有时间和 WAL 写入量。
 create or replace function dispatch_reward_batch(p_period bigint) returns integer language plpgsql as $$
 declare v_count integer;
 begin
@@ -260,7 +258,7 @@ begin
   return v_count;
 end $$;
 
--- Creates deterministic-but-different-per-period groups and freezes stage/tier.
+-- 生成“同周期可重复、不同周期会变化”的稳定分组，并冻结段位和学段。
 create or replace function create_period_groups(p_period bigint) returns void language plpgsql as $$
 begin
   insert into period_groups(period_id,tier,group_no)
