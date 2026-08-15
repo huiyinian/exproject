@@ -21,7 +21,8 @@ func main() {
 	// 结算、更新段位、分组和奖励均写入 period_jobs 后逐个消费。
 	scheduleTicker:=time.NewTicker(time.Minute)
 	// 单进程只有一个消费循环；数据库领取函数还会把多实例总并发限制为 1。
-	jobTicker:=time.NewTicker(200*time.Millisecond)
+	// 每批之间至少间隔 1 秒，用完成速度换取中午高峰期更平稳的数据库负载。
+	jobTicker:=time.NewTicker(time.Second)
 	defer scheduleTicker.Stop(); defer jobTicker.Stop()
 	for {
 		select {
