@@ -17,9 +17,10 @@ func main() {
 	a,err:=app.New(ctx,cfg); if err!=nil{log.Fatal(err)}
 	defer a.Close()
 
-	// Scheduling is intentionally cheap. Heavy settlement, grouping, and reward
-	// work is persisted in period_jobs and consumed separately below.
+	// 调度循环只负责检查周期并投递任务，不在 12:00 同步执行结算。
+	// 结算、更新段位、分组和奖励均写入 period_jobs 后逐个消费。
 	scheduleTicker:=time.NewTicker(time.Minute)
+	// 单进程只有一个消费循环；数据库领取函数还会把多实例总并发限制为 1。
 	jobTicker:=time.NewTicker(200*time.Millisecond)
 	defer scheduleTicker.Stop(); defer jobTicker.Stop()
 	for {
